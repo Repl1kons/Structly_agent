@@ -15,13 +15,21 @@ import base64
 import datetime as dt
 
 
-BACKEND_URL = os.getenv("STRUCTLY_BACKEND_URL", "https://structly.elevo.space").rstrip("/")
-AGENT_TOKEN = os.getenv("STRUCTLY_AGENT_TOKEN", "")
+def _getenv_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or default
+
+
+BACKEND_URL = _getenv_str("STRUCTLY_BACKEND_URL", "https://structly.elevo.space").rstrip("/")
+AGENT_TOKEN = _getenv_str("STRUCTLY_AGENT_TOKEN")
 POLL_INTERVAL_SECONDS = int(os.getenv("STRUCTLY_AGENT_POLL_INTERVAL", "10"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("STRUCTLY_AGENT_TIMEOUT", "120"))
-PG_DUMP_BIN = os.getenv("PG_DUMP_BIN", "pg_dump")
-PSQL_BIN = os.getenv("PSQL_BIN", "psql")
-AGENT_STATE_DIR = Path(os.getenv("STRUCTLY_AGENT_STATE_DIR", "/agent/state"))
+PG_DUMP_BIN = _getenv_str("PG_DUMP_BIN", "pg_dump")
+PSQL_BIN = _getenv_str("PSQL_BIN", "psql")
+AGENT_STATE_DIR = Path(_getenv_str("STRUCTLY_AGENT_STATE_DIR", "/agent/state"))
 PRIVATE_KEY_PATH = AGENT_STATE_DIR / "agent_private_key.pem"
 CERTIFICATE_PATH = AGENT_STATE_DIR / "agent_certificate.pem"
 ENCRYPTED_SECRET_PREFIX = "rsa_oaep_sha256:"
@@ -42,7 +50,7 @@ def _headers() -> dict[str, str]:
 
 def _client() -> httpx.Client:
     return httpx.Client(
-        base_url=("STRUCTLY_BACKEND_URL", BACKEND_URL),
+        base_url=_require_env("STRUCTLY_BACKEND_URL", BACKEND_URL),
         headers=_headers(),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
@@ -253,6 +261,7 @@ def _process_job(client: httpx.Client, job: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    _require_env("STRUCTLY_BACKEND_URL", BACKEND_URL)
     _require_env("STRUCTLY_AGENT_TOKEN", AGENT_TOKEN)
     _, certificate_pem = _ensure_certificate_pair()
 
