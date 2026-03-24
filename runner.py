@@ -35,22 +35,16 @@ CERTIFICATE_PATH = AGENT_STATE_DIR / "agent_certificate.pem"
 ENCRYPTED_SECRET_PREFIX = "rsa_oaep_sha256:"
 
 
-def _require_env(name: str, value: str) -> str:
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
 def _headers() -> dict[str, str]:
     return {
-        "X-Agent-Token": _require_env("STRUCTLY_AGENT_TOKEN", AGENT_TOKEN),
+        "X-Agent-Token": AGENT_TOKEN,
         "Content-Type": "application/json",
     }
 
 
 def _client() -> httpx.Client:
     return httpx.Client(
-        base_url=_require_env("STRUCTLY_BACKEND_URL", BACKEND_URL),
+        base_url=BACKEND_URL,
         headers=_headers(),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
@@ -261,8 +255,6 @@ def _process_job(client: httpx.Client, job: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    _require_env("STRUCTLY_BACKEND_URL", BACKEND_URL)
-    _require_env("STRUCTLY_AGENT_TOKEN", AGENT_TOKEN)
     _, certificate_pem = _ensure_certificate_pair()
 
     with _client() as client:
