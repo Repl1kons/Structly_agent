@@ -42,7 +42,7 @@ def _headers() -> dict[str, str]:
 
 def _client() -> httpx.Client:
     return httpx.Client(
-        base_url=_require_env("STRUCTLY_BACKEND_URL", BACKEND_URL),
+        base_url=("STRUCTLY_BACKEND_URL", BACKEND_URL),
         headers=_headers(),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
@@ -253,7 +253,6 @@ def _process_job(client: httpx.Client, job: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    _require_env("STRUCTLY_BACKEND_URL", BACKEND_URL)
     _require_env("STRUCTLY_AGENT_TOKEN", AGENT_TOKEN)
     _, certificate_pem = _ensure_certificate_pair()
 
