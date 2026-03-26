@@ -94,6 +94,14 @@ def _complete_connection_test(client: httpx.Client, job_uuid: str, ok: bool, mes
     )
 
 
+def _complete_scan(client: httpx.Client, job_uuid: str, databases: list[dict[str, Any]]) -> dict[str, Any]:
+    return _post(
+        client,
+        f"/api/v1/agent/jobs/{job_uuid}/complete-scan",
+        {"databases": databases},
+    )
+
+
 def _build_pg_dump_command(connection: dict[str, Any]) -> list[str]:
     return [
         PG_DUMP_BIN,
@@ -190,7 +198,6 @@ def _dump_schema(connection: dict[str, Any]) -> str:
 def _run_select_1(connection: dict[str, Any]) -> str:
     env = os.environ.copy()
     env["PGPASSWORD"] = _decrypt_secret(connection["password_encrypted"], PRIVATE_KEY_PATH.read_text(encoding="utf-8"))
-    env["PGSSLMODE"] = "require" if connection.get("ssl_on") else "disable"
 
     command = [
         PSQL_BIN,
@@ -223,6 +230,72 @@ def _run_select_1(connection: dict[str, Any]) -> str:
     return "Connection successful"
 
 
+def _run_psql_query(connection: dict[str, Any], database_name: str, sql: str) -> list[str]:
+    env = os.environ.copy()
+    env["PGPASSWORD"] = _decrypt_secret(connection["password_encrypted"], PRIVATE_KEY_PATH.read_text(encoding="utf-8"))
+
+    command = [
+        PSQL_BIN,
+        "-h",
+        connection["host"],
+        "-p",
+        str(connection["port"]),
+        "-U",
+        connection["username"],
+        "-d",
+        database_name,
+        "-tA",
+        "-c",
+        sql,
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip() or "psql query failed"
+        raise RuntimeError(stderr)
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _scan_databases_and_schemas(connection: dict[str, Any]) -> list[dict[str, Any]]:
+    control_database = connection.get("database_name") or "postgres"
+    databases = _run_psql_query(
+        connection,
+        control_database,
+        """
+        SELECT datname
+        FROM pg_database
+        WHERE datistemplate = FALSE
+        ORDER BY datname;
+        """.strip(),
+    )
+
+    result: list[dict[str, Any]] = []
+    for database_name in databases:
+        schemas = _run_psql_query(
+            connection,
+            database_name,
+            """
+            SELECT schema_name
+            FROM information_schema.schemata
+            WHERE schema_name <> 'information_schema'
+              AND schema_name NOT LIKE 'pg_%'
+            ORDER BY schema_name;
+            """.strip(),
+        )
+        result.append(
+            {
+                "database_name": database_name,
+                "schemas": [{"schema_name": schema_name} for schema_name in schemas],
+            }
+        )
+    return result
+
+
 def _upload_sql(client: httpx.Client, job_uuid: str, sql: str) -> dict[str, Any]:
     return _post(client, f"/api/v1/agent/jobs/{job_uuid}/upload_sql", {"sql": sql})
 
@@ -231,13 +304,16 @@ def _process_job(client: httpx.Client, job: dict[str, Any]) -> None:
     job_uuid = job["job_uuid"]
     job_type = job.get("job_type", "sync")
     connection = job["connection"]
-    _log("job_claimed", job_uuid=job_uuid, job_type=job_type, integration_uuid=connection["integration_uuid"])
+    _log("job_claimed", job_uuid=job_uuid, job_type=job_type, agent_uuid=connection["agent_uuid"])
 
     try:
         _start_job(client, job_uuid)
         if job_type == "connection_test":
             message = _run_select_1(connection)
             result = _complete_connection_test(client, job_uuid, True, message)
+        elif job_type == "scan":
+            databases = _scan_databases_and_schemas(connection)
+            result = _complete_scan(client, job_uuid, databases)
         else:
             sql = _dump_schema(connection)
             result = _upload_sql(client, job_uuid, sql)
