@@ -62,6 +62,11 @@ def _post(client: httpx.Client, path: str, payload: dict[str, Any] | None = None
     return body.get("result")
 
 
+def _certificate_fingerprint(certificate_pem: str) -> str:
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("utf-8"))
+    return certificate.fingerprint(hashes.SHA256()).hex()
+
+
 def _heartbeat(client: httpx.Client) -> None:
     result = _post(client, "/api/v1/agent/heartbeat")
     _log("heartbeat", result=result)
@@ -145,12 +150,24 @@ def _generate_self_signed_certificate(common_name: str) -> tuple[str, str]:
 def _ensure_certificate_pair() -> tuple[str, str]:
     AGENT_STATE_DIR.mkdir(parents=True, exist_ok=True)
     if PRIVATE_KEY_PATH.exists() and CERTIFICATE_PATH.exists():
-        return PRIVATE_KEY_PATH.read_text(encoding="utf-8"), CERTIFICATE_PATH.read_text(encoding="utf-8")
+        private_key_pem = PRIVATE_KEY_PATH.read_text(encoding="utf-8")
+        certificate_pem = CERTIFICATE_PATH.read_text(encoding="utf-8")
+        _log(
+            "certificate_loaded",
+            state_dir=str(AGENT_STATE_DIR),
+            certificate_fingerprint=_certificate_fingerprint(certificate_pem),
+        )
+        return private_key_pem, certificate_pem
 
     common_name = os.getenv("STRUCTLY_AGENT_COMMON_NAME", os.getenv("COMPUTERNAME", "structly-agent"))
     private_key_pem, certificate_pem = _generate_self_signed_certificate(common_name)
     PRIVATE_KEY_PATH.write_text(private_key_pem, encoding="utf-8")
     CERTIFICATE_PATH.write_text(certificate_pem, encoding="utf-8")
+    _log(
+        "certificate_created",
+        state_dir=str(AGENT_STATE_DIR),
+        certificate_fingerprint=_certificate_fingerprint(certificate_pem),
+    )
     return private_key_pem, certificate_pem
 
 
@@ -160,21 +177,26 @@ def _decrypt_secret(secret: str, private_key_pem: str) -> str:
 
     encrypted = base64.b64decode(secret[len(ENCRYPTED_SECRET_PREFIX):])
     private_key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
-    plaintext = private_key.decrypt(
-        encrypted,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
+    try:
+        plaintext = private_key.decrypt(
+            encrypted,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "Decryption failed: the encrypted secret does not match the current agent private key. "
+            "If the agent was restarted in a new container, make sure STRUCTLY_AGENT_STATE_DIR is persisted."
+        ) from exc
     return plaintext.decode("utf-8")
 
 
 def _dump_schema(connection: dict[str, Any]) -> str:
     env = os.environ.copy()
     env["PGPASSWORD"] = _decrypt_secret(connection["password_encrypted"], PRIVATE_KEY_PATH.read_text(encoding="utf-8"))
-    env["PGSSLMODE"] = "require" if connection.get("ssl_on") else "disable"
 
     command = _build_pg_dump_command(connection)
     _log("running_pg_dump", command=command, host=connection["host"], database=connection["database_name"])

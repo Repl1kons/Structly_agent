@@ -58,8 +58,20 @@ docker build -t structly-agent .
 ## Запуск
 
 ``` bash
-docker run --rm -e STRUCTLY_AGENT_TOKEN={YOUR_AGENT_TOKEN} structly-agent
+docker run --rm \
+  -e STRUCTLY_AGENT_TOKEN={YOUR_AGENT_TOKEN} \
+  -v structly-agent-state:/agent/state \
+  structly-agent
 ```
+или 
+``` bash
+docker compose up -d --build
+```
+
+Важно: директория `STRUCTLY_AGENT_STATE_DIR` должна переживать рестарты контейнера.
+Если ключи агента потеряются и будут сгенерированы заново, backend может продолжить
+отдавать пароль БД, зашифрованный старым публичным ключом, и агент получит ошибку
+`Decryption failed`.
 
 ## Как это работает (кратко)
 

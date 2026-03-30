@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  structly-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: structly-agent:local
+    container_name: structly-agent
+    restart: unless-stopped
+    environment:
+      STRUCTLY_AGENT_TOKEN: YOUR_AGENT_TOKEN
+      STRUCTLY_BACKEND_URL: https://structly.elevo.space
+      STRUCTLY_AGENT_STATE_DIR: /agent/state
+    volumes:
+      - structly-agent-state:/agent/state
+
+volumes:
+  structly-agent-state:
