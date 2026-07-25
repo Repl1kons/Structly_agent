@@ -9,11 +9,6 @@ services:
     container_name: structly-agent
     restart: unless-stopped
     environment:
-      STRUCTLY_AGENT_TOKEN: YOUR_AGENT_TOKEN
-      STRUCTLY_BACKEND_URL: https://structly.elevo.space
-      STRUCTLY_AGENT_STATE_DIR: /agent/state
-    volumes:
-      - structly-agent-state:/agent/state
-
-volumes:
-  structly-agent-state:
+      STRUCTLY_AGENT_TOKEN: ${STRUCTLY_AGENT_TOKEN:?set STRUCTLY_AGENT_TOKEN in .env}
+      STRUCTLY_BACKEND_URL: ${STRUCTLY_BACKEND_URL:-https://structly.elevo.space}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}

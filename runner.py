@@ -1,19 +1,12 @@
-import base64
-import datetime as dt
 import json
 import logging
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
 from typing import Any
 
 import httpx
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.x509.oid import NameOID
 
 
 def _getenv_str(name: str, default: str = "") -> str:
@@ -36,6 +29,7 @@ def _getenv_int(name: str, default: int) -> int:
 
 BACKEND_URL = _getenv_str("STRUCTLY_BACKEND_URL", "https://structly.elevo.space").rstrip("/")
 AGENT_TOKEN = _getenv_str("STRUCTLY_AGENT_TOKEN")
+DB_PASSWORD = _getenv_str("DB_PASSWORD")
 
 POLL_INTERVAL_SECONDS = _getenv_int("STRUCTLY_AGENT_POLL_INTERVAL", 10)
 
@@ -46,12 +40,6 @@ DUMP_TIMEOUT_SECONDS = _getenv_int("STRUCTLY_AGENT_TIMEOUT_DUMP", 600)
 
 PG_DUMP_BIN = _getenv_str("PG_DUMP_BIN", "pg_dump")
 PSQL_BIN = _getenv_str("PSQL_BIN", "psql")
-
-AGENT_STATE_DIR = Path(_getenv_str("STRUCTLY_AGENT_STATE_DIR", "/agent/state"))
-PRIVATE_KEY_PATH = AGENT_STATE_DIR / "agent_private_key.pem"
-CERTIFICATE_PATH = AGENT_STATE_DIR / "agent_certificate.pem"
-
-ENCRYPTED_SECRET_PREFIX = "rsa_oaep_sha256:"
 
 
 logger = logging.getLogger("structly_agent")
@@ -116,11 +104,6 @@ def _post(
     return body.get("result")
 
 
-def _certificate_fingerprint(certificate_pem: str) -> str:
-    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("utf-8"))
-    return certificate.fingerprint(hashes.SHA256()).hex()
-
-
 def _heartbeat(client: httpx.Client) -> None:
     result = _post(client, "/api/v1/agent/heartbeat")
     _log(logging.DEBUG, "heartbeat", result=result)
@@ -128,17 +111,6 @@ def _heartbeat(client: httpx.Client) -> None:
 
 def _claim_job(client: httpx.Client) -> dict[str, Any] | None:
     return _post(client, "/api/v1/agent/jobs/claim")
-
-
-def _register_certificate(
-    client: httpx.Client,
-    certificate_public_pem: str,
-) -> dict[str, Any] | None:
-    return _post(
-        client,
-        "/api/v1/agent/certificate/register",
-        {"certificate_public_pem": certificate_public_pem},
-    )
 
 
 def _start_job(client: httpx.Client, job_uuid: str) -> None:
@@ -211,93 +183,9 @@ def _build_pg_dump_command(connection: dict[str, Any]) -> list[str]:
     ]
 
 
-def _generate_self_signed_certificate(common_name: str) -> tuple[str, str]:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
-
-    certificate = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1))
-        .not_valid_after(dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3650))
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .sign(private_key, hashes.SHA256())
-    )
-
-    private_key_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
-
-    certificate_pem = certificate.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-    return private_key_pem, certificate_pem
-
-
-def _ensure_certificate_pair() -> tuple[str, str]:
-    AGENT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if PRIVATE_KEY_PATH.exists() and CERTIFICATE_PATH.exists():
-        private_key_pem = PRIVATE_KEY_PATH.read_text(encoding="utf-8")
-        certificate_pem = CERTIFICATE_PATH.read_text(encoding="utf-8")
-        _log(
-            logging.INFO,
-            "certificate_loaded",
-            state_dir=str(AGENT_STATE_DIR),
-            certificate_fingerprint=_certificate_fingerprint(certificate_pem),
-        )
-        return private_key_pem, certificate_pem
-
-    common_name = os.getenv("STRUCTLY_AGENT_COMMON_NAME", os.getenv("COMPUTERNAME", "structly-agent"))
-    private_key_pem, certificate_pem = _generate_self_signed_certificate(common_name)
-
-    PRIVATE_KEY_PATH.write_text(private_key_pem, encoding="utf-8")
-    CERTIFICATE_PATH.write_text(certificate_pem, encoding="utf-8")
-
-    _log(
-        logging.INFO,
-        "certificate_created",
-        state_dir=str(AGENT_STATE_DIR),
-        certificate_fingerprint=_certificate_fingerprint(certificate_pem),
-    )
-    return private_key_pem, certificate_pem
-
-
-def _decrypt_secret(secret: str, private_key_pem: str) -> str:
-    if not secret.startswith(ENCRYPTED_SECRET_PREFIX):
-        return secret
-
-    encrypted = base64.b64decode(secret[len(ENCRYPTED_SECRET_PREFIX):])
-    private_key = serialization.load_pem_private_key(
-        private_key_pem.encode("utf-8"),
-        password=None,
-    )
-
-    try:
-        plaintext = private_key.decrypt(
-            encrypted,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None,
-            ),
-        )
-    except ValueError as exc:
-        raise RuntimeError(
-            "Decryption failed: the encrypted secret does not match the current agent private key. "
-            "If the agent was restarted in a new container, make sure STRUCTLY_AGENT_STATE_DIR is persisted."
-        ) from exc
-
-    return plaintext.decode("utf-8")
-
-
 def _build_pg_env(connection: dict[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
-    private_key_pem = PRIVATE_KEY_PATH.read_text(encoding="utf-8")
-    env["PGPASSWORD"] = _decrypt_secret(connection["password_encrypted"], private_key_pem)
+    env["PGPASSWORD"] = DB_PASSWORD
     return env
 
 
@@ -553,18 +441,12 @@ def main() -> int:
     if not AGENT_TOKEN:
         _log(logging.ERROR, "missing_agent_token", env_var="STRUCTLY_AGENT_TOKEN")
         return 1
+    if not DB_PASSWORD:
+        _log(logging.ERROR, "missing_db_password", env_var="DB_PASSWORD")
+        return 1
 
     try:
-        _, certificate_pem = _ensure_certificate_pair()
-
         with _client() as client:
-            register_result = _register_certificate(client, certificate_pem)
-
-            _log(
-                logging.INFO,
-                "certificate_registered",
-                result=register_result,
-            )
             _log(
                 logging.INFO,
                 "agent_started",
@@ -574,7 +456,6 @@ def main() -> int:
                 connect_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
                 query_timeout_seconds=QUERY_TIMEOUT_SECONDS,
                 dump_timeout_seconds=DUMP_TIMEOUT_SECONDS,
-                state_dir=str(AGENT_STATE_DIR),
             )
 
             while True:
