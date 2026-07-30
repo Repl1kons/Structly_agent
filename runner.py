@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -37,12 +38,75 @@ HTTP_TIMEOUT_SECONDS = _getenv_int("STRUCTLY_AGENT_HTTP_TIMEOUT", 30)
 CONNECT_TIMEOUT_SECONDS = _getenv_int("STRUCTLY_AGENT_TIMEOUT_CONNECT", 10)
 QUERY_TIMEOUT_SECONDS = _getenv_int("STRUCTLY_AGENT_TIMEOUT_QUERY", 60)
 DUMP_TIMEOUT_SECONDS = _getenv_int("STRUCTLY_AGENT_TIMEOUT_DUMP", 600)
+LOG_MAX_VALUE_LENGTH = _getenv_int("STRUCTLY_AGENT_LOG_MAX_VALUE_LENGTH", 4000)
 
 PG_DUMP_BIN = _getenv_str("PG_DUMP_BIN", "pg_dump")
 PSQL_BIN = _getenv_str("PSQL_BIN", "psql")
 
 
 logger = logging.getLogger("structly_agent")
+
+
+class BackendRequestError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        path: str,
+        status_code: int,
+        response_body: Any,
+        elapsed_ms: int,
+    ) -> None:
+        self.path = path
+        self.status_code = status_code
+        self.response_body = response_body
+        self.elapsed_ms = elapsed_ms
+        super().__init__(f"Backend returned {status_code} for {path}")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def _truncate_text(value: str, max_length: int = LOG_MAX_VALUE_LENGTH) -> str:
+    if len(value) <= max_length:
+        return value
+    omitted = len(value) - max_length
+    return f"{value[:max_length]}...<truncated {omitted} chars>"
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, str):
+        return _truncate_text(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, int | float | bool) or value is None:
+        return value
+    return _truncate_text(str(value))
+
+
+def _payload_summary(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    summary: dict[str, Any] = {"keys": sorted(payload.keys())}
+    if "databases" in payload and isinstance(payload["databases"], list):
+        databases = payload["databases"]
+        summary["databases_count"] = len(databases)
+        summary["schemas_count"] = sum(len(item.get("schemas") or []) for item in databases if isinstance(item, dict))
+    if "sql" in payload and isinstance(payload["sql"], str):
+        summary["sql_length"] = len(payload["sql"])
+    return summary
+
+
+def _response_body(response: httpx.Response) -> Any:
+    text = response.text
+    if not text:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        return _truncate_text(text)
 
 
 def _setup_logging() -> None:
@@ -54,18 +118,20 @@ def _setup_logging() -> None:
     class JsonFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
             payload: dict[str, Any] = {
+                "timestamp": _utc_timestamp(),
                 "level": record.levelname.lower(),
                 "message": record.getMessage(),
                 "logger": record.name,
+                "pid": os.getpid(),
             }
             extra = getattr(record, "extra_data", None)
             if isinstance(extra, dict):
-                payload.update(extra)
+                payload.update(_json_safe(extra))
 
             if record.exc_info:
                 payload["exception"] = self.formatException(record.exc_info)
 
-            return json.dumps(payload, ensure_ascii=False)
+            return json.dumps(payload, ensure_ascii=False, default=str)
 
     handler.setFormatter(JsonFormatter())
     logger.setLevel(level)
@@ -74,8 +140,8 @@ def _setup_logging() -> None:
     logger.propagate = False
 
 
-def _log(level: int, message: str, **extra: Any) -> None:
-    logger.log(level, message, extra={"extra_data": extra})
+def _log(level: int, message: str, *, exc_info: bool = False, **extra: Any) -> None:
+    logger.log(level, message, extra={"extra_data": extra}, exc_info=exc_info)
 
 
 def _headers() -> dict[str, str]:
@@ -92,15 +158,77 @@ def _client() -> httpx.Client:
         timeout=HTTP_TIMEOUT_SECONDS,
     )
 
+def decode(data: bytes) -> str:
+    for enc in ("utf-8", "cp1251", "cp866"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return data.decode("utf-8", errors="replace")
 
 def _post(
     client: httpx.Client,
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    response = client.post(path, json=payload)
-    response.raise_for_status()
-    body = response.json()
+    started = time.perf_counter()
+    payload_summary = _payload_summary(payload)
+    _log(logging.DEBUG, "backend_request_started", path=path, payload_summary=payload_summary)
+
+    try:
+        response = client.post(path, json=payload)
+    except httpx.RequestError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        _log(
+            logging.ERROR,
+            "backend_request_failed",
+            path=path,
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+            exc_info=True,
+        )
+        raise RuntimeError(f"Backend request failed for {path}: {exc}") from exc
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if response.is_error:
+        body = _response_body(response)
+        _log(
+            logging.ERROR,
+            "backend_response_error",
+            path=path,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+            response_body=body,
+            payload_summary=payload_summary,
+        )
+        raise BackendRequestError(
+            path=path,
+            status_code=response.status_code,
+            response_body=body,
+            elapsed_ms=elapsed_ms,
+        )
+
+    _log(
+        logging.DEBUG,
+        "backend_request_completed",
+        path=path,
+        status_code=response.status_code,
+        elapsed_ms=elapsed_ms,
+    )
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        _log(
+            logging.ERROR,
+            "backend_invalid_json_response",
+            path=path,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+            response_body=_response_body(response),
+            exc_info=True,
+        )
+        raise RuntimeError(f"Backend returned invalid JSON for {path}") from exc
     return body.get("result")
 
 
@@ -198,14 +326,19 @@ def _run_command(
     timeout_seconds: int,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        result = subprocess.run(
             command,
             capture_output=True,
-            text=True,
+            text=False,
             env=env,
             check=False,
             timeout=timeout_seconds,
         )
+        
+        result.stdout = decode(result.stdout)
+        result.stderr = decode(result.stderr)
+        
+        return result
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
             f"{timeout_label} timed out after {timeout_seconds} seconds "
@@ -368,7 +501,14 @@ def _scan_databases_and_schemas(connection: dict[str, Any]) -> list[dict[str, An
         result.append(
             {
                 "database_name": database_name,
-                "schemas": [{"schema_name": schema_name} for schema_name in schemas],
+                "external_database_key": database_name,
+                "schemas": [
+                    {
+                        "schema_name": schema_name,
+                        "external_schema_key": schema_name,
+                    }
+                    for schema_name in schemas
+                ],
             }
         )
 
